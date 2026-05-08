@@ -1,6 +1,6 @@
 {
   "name": "pi-skill-guard",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "type": "module",
   "description": "Pi extension for protecting against incorrect skill-in-tool-call behavior",
   "main": "index.ts",
@@ -24,11 +24,11 @@
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
-    "@sinclair/typebox": "*"
+    "@mariozechner/pi-ai": "*"
   },
   "devDependencies": {
     "@mariozechner/pi-coding-agent": "^0.70.6",
-    "@sinclair/typebox": "^0.34.49",
+    "@mariozechner/pi-ai": "^0.70.6",
     "knip": "^6.9.0",
     "typescript": "^6.0.3"
   },
