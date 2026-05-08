@@ -12,28 +12,75 @@ pi install npm:pi-skill-guard
 
 ## What it does
 
-This extension protects against incorrect skill invocation patterns. When an LLM tries to call a tool name that matches an available skill (e.g., calling `brave-search` as a tool instead of using `/skill:brave-search` or loading the skill manually), this extension intercepts the call and redirects it to read the skill's `SKILL.md` file instead.
+This extension protects against incorrect skill invocation patterns. When an LLM tries to call a tool name that matches an available skill (e.g., calling `brave-search` as a tool instead of using `/skill:brave-search` or loading the skill manually), this extension **intercepts the error** and replaces it with the skill's documentation.
 
 ### How it works
 
-1. Listens to the `tool_call` event
-2. Checks if the tool name matches any available skill
-3. If matched, automatically converts the tool call to a `read` tool call that loads the skill's SKILL.md file
-4. Notifies the user via UI that the skill was redirected
+**Key insight**: The extension uses the `context` event to intercept and fix "tool not found" errors right before they're sent to the LLM.
 
-This ensures the LLM can still access the skill content even when it incorrectly tries to invoke the skill as a tool.
+1. **Session start**: Load all available skills and cache their file paths
+2. **LLM calls wrong tool**: Agent creates a "Tool X not found" error message
+3. **Before next turn**: Extension's `context` handler intercepts the message flow
+4. **Detect & fix**: Replaces error with actual skill documentation from SKILL.md file
+5. **LLM sees success**: Instead of an error, the LLM receives the skill content and can learn from it
+
+### Architecture note
+
+The `context` event fires in `transformContext()` before each LLM call, allowing us to:
+- Modify messages non-destructively (returns new array)
+- Replace tool result errors with successful results
+- Add educational notes suggesting proper `/skill:name` usage
+
+This is **more efficient than pre-registering skills as tools** because:
+- ✅ No token overhead from adding extra tool schemas to every request
+- ✅ No cluttering the available tools list
+- ✅ Simpler code without TypeBox schemas
+- ✅ Better UX: actually loads skill documentation instead of just warning
 
 ### Example
 
 If the model incorrectly calls:
-```
-tool_call { toolName: "brave-search", input: {...} }
+```json
+{ toolName: "brave-search", input: { ... } }
 ```
 
-The extension will redirect it to:
+**Without skill-guard:**
+```json
+// The agent creates this error message
+{
+  role: "toolResult",
+  toolCallId: "call_abc123",
+  toolName: "brave-search",
+  content: [{ text: "Tool brave-search not found" }],
+  isError: true
+}
 ```
-tool_call { toolName: "read", input: { path: "~/.pi/agent/skills/brave-search/SKILL.md" } }
+
+**With skill-guard:**
+```json
+// Extension intercepts via context event and replaces with raw SKILL.md content:
+{
+  role: "toolResult",
+  toolCallId: "call_abc123",
+  toolName: "brave-search",
+  content: [{ 
+    text: `# brave-search
+\nA pi extension for searching...
+
+## Install
+...
+` // ← Actual file content, no wrapping!
+  }],
+  details: {
+    path: "~/.pi/agent/skills/brave-search/SKILL.md",
+    sizeBytes: 1428,
+    source: "skill_guard_intercept"
+  },
+  isError: false  // ← Fixed!
+}
 ```
+
+The LLM receives exactly the same content as if it had used the `read` tool on the SKILL.md file.
 
 ---
 
