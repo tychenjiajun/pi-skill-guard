@@ -2,15 +2,19 @@
 import { promises as fs } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomBytes } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { tmpdir } from "node:os";
-import { randomBytes } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   getAgentDir,
   loadSkills,
   type Skill,
   createLocalBashOperations,
+  truncateTail,
+  DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_LINES,
+  formatSize,
 } from "@earendil-works/pi-coding-agent";
 import type { ToolResultMessage, ToolCall } from "@earendil-works/pi-ai";
 
@@ -58,166 +62,116 @@ const findSkillFilePath = async (skill: Skill): Promise<string> => {
   }
 };
 
-// Copy of truncateTail and DEFAULT_MAX_BYTES/DEFAULT_MAX_LINES from @mariozechner/pi-coding-agent/dist/core/tools/truncate
-const DEFAULT_MAX_LINES = 500;
-const DEFAULT_MAX_BYTES = 100 * 1024; // 100KB
-
 function getTempFilePath() {
   const id = randomBytes(8).toString("hex");
   return join(tmpdir(), `pi-bash-${id}.log`);
 }
 
-function truncateTail(text: string) {
-  const lines = text.split("\n");
-  const totalLines = lines.length;
-  
-  // First truncate by lines
-  let truncatedLines = lines.slice(-DEFAULT_MAX_LINES);
-  let truncatedBy: "lines" | "bytes" | undefined = totalLines > DEFAULT_MAX_LINES ? "lines" : undefined;
-  
-  // Then truncate by bytes
-  let result = truncatedLines.join("\n");
-  let bytes = Buffer.byteLength(result, "utf8");
-  if (bytes > DEFAULT_MAX_BYTES) {
-    truncatedBy = "bytes";
-    // Binary search to find the right truncation point
-    let low = 0;
-    let high = result.length;
-    let best = 0;
-    while (low <= high) {
-      const mid = Math.floor((low + high) / 2);
-      const slice = result.slice(-mid);
-      const sliceBytes = Buffer.byteLength(slice, "utf8");
-      if (sliceBytes <= DEFAULT_MAX_BYTES) {
-        best = mid;
-        low = mid + 1;
-      } else {
-        high = mid - 1;
-      }
-    }
-    result = result.slice(-best);
+async function executeBashCommand(
+  cwd: string,
+  command: string,
+  timeoutSeconds?: number,
+  parentSignal?: AbortSignal
+) {
+  // Handle timeout by creating an AbortSignal that aborts after timeout
+  // and also respects the parent signal
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeoutController = new AbortController();
+
+  if (timeoutSeconds !== undefined && timeoutSeconds > 0) {
+    timeoutId = setTimeout(() => timeoutController.abort(), timeoutSeconds * 1000);
   }
 
-  const outputLines = result.split("\n").length;
-  const lastLinePartial = truncatedBy === "bytes" && outputLines === 1 && totalLines > 1;
-  
-  return {
-    content: result,
-    truncated: truncatedBy !== undefined,
-    truncatedBy,
-    totalLines,
-    outputLines,
-    outputBytes: Buffer.byteLength(result, "utf8"),
-    maxBytes: DEFAULT_MAX_BYTES,
-    lastLinePartial,
-  };
-}
+  // Combine parent signal and timeout signal
+  const combinedSignal = parentSignal
+    ? AbortSignal.any([parentSignal, timeoutController.signal])
+    : timeoutController.signal;
 
-function formatSize(bytes: number) {
-  if (bytes < 1024) return `${bytes}B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)}KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(0)}MB`;
-}
-
-async function executeBashCommand(command: string, timeout: number | undefined, cwd: string, signal?: AbortSignal) {
   const ops = createLocalBashOperations();
-  return new Promise<{
-    content: Array<{ type: "text"; text: string }>;
-    details?: any;
-    isError: boolean;
-  }>((resolve) => {
-    let tempFilePath: string | undefined;
-    let tempFileStream: any;
-    let totalBytes = 0;
-    const chunks: Buffer[] = [];
-    let chunksBytes = 0;
-    const maxChunksBytes = DEFAULT_MAX_BYTES * 2;
 
-    const ensureTempFile = () => {
-      if (tempFilePath) return;
-      tempFilePath = getTempFilePath();
-      tempFileStream = createWriteStream(tempFilePath);
-      for (const chunk of chunks) tempFileStream.write(chunk);
-    };
+  const chunks: string[] = [];
+  let totalBytes = 0;
+  const maxOutputBytes = DEFAULT_MAX_BYTES * 2;
+  let tempFilePath: string | undefined;
+  let tempFileStream: ReturnType<typeof createWriteStream> | undefined;
 
-    const handleData = (data: Buffer) => {
-      totalBytes += data.length;
-      if (totalBytes > DEFAULT_MAX_BYTES) {
-        ensureTempFile();
-      }
-      if (tempFileStream) tempFileStream.write(data);
-      chunks.push(data);
-      chunksBytes += data.length;
-      while (chunksBytes > maxChunksBytes && chunks.length > 1) {
-        const removed = chunks.shift()!;
-        chunksBytes -= removed.length;
-      }
-    };
+  const ensureTempFile = () => {
+    if (tempFilePath) return;
+    tempFilePath = getTempFilePath();
+    tempFileStream = createWriteStream(tempFilePath);
+    for (const chunk of chunks) tempFileStream.write(chunk);
+  };
 
-    const execOpts: any = { onData: handleData };
-    if (signal) execOpts.signal = signal;
-    if (typeof timeout === "number") execOpts.timeout = timeout;
-    
-    ops.exec(command, cwd, execOpts)
-      .then(({ exitCode }) => {
-        const fullBuffer = Buffer.concat(chunks);
-        const fullOutput = fullBuffer.toString("utf-8");
-        const truncation = truncateTail(fullOutput);
-        if (truncation.truncated) {
-          ensureTempFile();
-        }
-        if (tempFileStream) tempFileStream.end();
+  const handleData = (data: Buffer) => {
+    totalBytes += data.length;
+    const text = data.toString("utf-8");
 
-        let outputText = truncation.content || "(no output)";
-        let details: any;
-        if (truncation.truncated) {
-          details = { truncation, fullOutputPath: tempFilePath };
-          const startLine = truncation.totalLines - truncation.outputLines + 1;
-          const endLine = truncation.totalLines;
-          if (truncation.lastLinePartial) {
-            const lastLineSize = formatSize(Buffer.byteLength(fullOutput.split("\n").pop() || "", "utf-8"));
-            outputText += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). Full output: ${tempFilePath}]`;
-          } else if (truncation.truncatedBy === "lines") {
-            outputText += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output: ${tempFilePath}]`;
-          } else {
-            outputText += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Full output: ${tempFilePath}]`;
-          }
-        }
-        if (exitCode !== 0 && exitCode !== null) {
-          outputText += `\n\nCommand exited with code ${exitCode}`;
-          resolve({
-            content: [{ type: "text", text: outputText }],
-            details,
-            isError: true,
-          });
-        } else {
-          resolve({
-            content: [{ type: "text", text: outputText }],
-            details,
-            isError: false,
-          });
-        }
-      })
-      .catch((err) => {
-        if (tempFileStream) tempFileStream.end();
-        const fullBuffer = Buffer.concat(chunks);
-        let output = fullBuffer.toString("utf-8");
-        if (err.message === "aborted") {
-          if (output) output += "\n\n";
-          output += "Command aborted";
-        } else if (err.message.startsWith("timeout:")) {
-          const timeoutSecs = err.message.split(":")[1];
-          if (output) output += "\n\n";
-          output += `Command timed out after ${timeoutSecs} seconds`;
-        } else {
-          output = err.message;
-        }
-        resolve({
-          content: [{ type: "text", text: output }],
-          isError: true,
-        });
-      });
-  });
+    if (totalBytes > DEFAULT_MAX_BYTES) {
+      ensureTempFile();
+    }
+    if (tempFileStream) tempFileStream.write(text);
+
+    chunks.push(text);
+    totalBytes = chunks.join("").length;
+    while (totalBytes > maxOutputBytes && chunks.length > 1) {
+      const removed = chunks.shift();
+      totalBytes -= removed?.length ?? 0;
+    }
+  };
+
+  let exitCode: number | null | undefined;
+  let killed = false;
+
+  try {
+    const result = await ops.exec(command, cwd, {
+      onData: handleData,
+      signal: combinedSignal,
+    });
+    exitCode = result.exitCode;
+  } catch {
+    if (combinedSignal.aborted) {
+      killed = true;
+    }
+  }
+
+  if (timeoutId) clearTimeout(timeoutId);
+  if (tempFileStream) tempFileStream.end();
+
+  const fullOutput = chunks.join("");
+  const truncation = truncateTail(fullOutput);
+
+  if (truncation.truncated) {
+    ensureTempFile();
+  }
+
+  let text = truncation.content || "(no output)";
+
+  if (truncation.truncated && tempFilePath) {
+    const startLine = truncation.totalLines - truncation.outputLines + 1;
+    const endLine = truncation.totalLines;
+    if (truncation.lastLinePartial) {
+      text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine}. Full output: ${tempFilePath}]`;
+    } else if (truncation.truncatedBy === "lines") {
+      text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output: ${tempFilePath}]`;
+    } else {
+      text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Full output: ${tempFilePath}]`;
+    }
+  }
+
+  if (killed) {
+    if (timeoutController.signal.aborted && !parentSignal?.aborted) {
+      text += `\n\nCommand timed out after ${timeoutSeconds} seconds`;
+    } else {
+      text += "\n\nCommand was cancelled";
+    }
+  } else if (exitCode !== undefined && exitCode !== 0) {
+    text += `\n\nCommand exited with code ${exitCode}`;
+  }
+
+  return {
+    content: [{ type: "text" as const, text }],
+    isError: exitCode !== undefined && exitCode !== 0,
+  };
 }
 
 function findToolCall(messages: any[], toolCallId: string): ToolCall | undefined {
@@ -340,13 +294,12 @@ export default function skillGuardExtension(pi: ExtensionAPI) {
           }
 
           try {
-            const result = await executeBashCommand(command, timeoutNum, ctx.cwd, ctx.signal);
+            const result = await executeBashCommand(ctx.cwd, command, timeoutNum, ctx.signal);
             const fixedToolResult: ToolResultMessage = {
               role: "toolResult",
               toolCallId: toolResultMsg.toolCallId,
               toolName: "bash",
               content: result.content,
-              details: result.details,
               isError: result.isError,
               timestamp: Date.now(),
             };
