@@ -5,14 +5,14 @@ import { fileURLToPath } from "node:url";
 import { createWriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   getAgentDir,
   loadSkills,
   type Skill,
   createLocalBashOperations,
-} from "@mariozechner/pi-coding-agent";
-import type { ToolResultMessage, ToolCall } from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-coding-agent";
+import type { ToolResultMessage, ToolCall } from "@earendil-works/pi-ai";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
