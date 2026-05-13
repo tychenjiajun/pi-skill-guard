@@ -16,7 +16,8 @@ import {
   DEFAULT_MAX_LINES,
   formatSize,
 } from "@earendil-works/pi-coding-agent";
-import type { ToolResultMessage, ToolCall } from "@earendil-works/pi-ai";
+import type { ToolResultMessage } from "@earendil-works/pi-ai";
+import type { SessionMessageEntry } from "@earendil-works/pi-coding-agent";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -174,14 +175,44 @@ async function executeBashCommand(
   };
 }
 
-function findToolCall(messages: any[], toolCallId: string): ToolCall | undefined {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg && msg.role === "assistant") {
-      const contents = Array.isArray(msg.content) ? msg.content : [];
-      for (const content of contents) {
-        if (content && typeof content === "object" && "type" in content && content.type === "toolCall" && "id" in content && content.id === toolCallId) {
-          return content as ToolCall;
+function isToolNotFoundError(text: string): boolean {
+  const lower = text.toLowerCase().trim();
+  // Pi's bare "not found" error for missing tools
+  if (lower === "not found") return true;
+  // Tool-not-found or unknown-tool error patterns
+  if (lower.startsWith("tool not found") || lower.startsWith("unknown tool")) return true;
+  return false;
+}
+
+/**
+ * Find a tool call by ID from recent assistant messages.
+ * Only scans the last ~20 entries for efficiency - tool calls are always near their results.
+ */
+function findMatchingToolCall(
+  sessionManager: any,
+  toolCallId: string
+): { arguments?: Record<string, unknown> } | undefined {
+  const entries = sessionManager.getEntries();
+  // Scan backwards from most recent, limited to ~20 entries for performance
+  const scanLimit = Math.min(20, entries.length);
+  
+  for (let i = entries.length - 1; i >= entries.length - scanLimit; i--) {
+    const entry = entries[i];
+    if (entry.type === "message") {
+      const msgEntry = entry as SessionMessageEntry;
+      const msg = msgEntry.message;
+      if (msg.role === "assistant") {
+        const contents = Array.isArray(msg.content) ? msg.content : [];
+        for (const content of contents) {
+          if (
+            content &&
+            typeof content === "object" &&
+            "type" in content && content.type === "toolCall" &&
+            "id" in content && content.id === toolCallId &&
+            "arguments" in content
+          ) {
+            return { arguments: content.arguments };
+          }
         }
       }
     }
@@ -215,107 +246,103 @@ export default function skillGuardExtension(pi: ExtensionAPI) {
   });
 
   /**
-   * Intercept "tool not found" errors for skill names.
-   * Replaces them with successful results showing the skill documentation.
+   * Intercept "tool not found" errors via message_end event.
+   * When a tool doesn't exist, pi creates an immediate error that bypasses afterToolCall,
+   * so tool_result event never fires. However, message_end always fires for all messages
+   * and allows replacing the message in place.
    */
-  pi.on("context", async (event, ctx) => {
-    const messages = [...event.messages];
-    let modified = false;
+  pi.on("message_end", async (event, ctx) => {
+    const msg = event.message;
     
-    // Find tool result messages with "tool not found" errors for our skills
-    for (let i = 0; i < messages.length; i++) {
-      const msg = messages[i];
-      if (!msg || (msg as any).role !== "toolResult") {
-        continue;
-      }
+    // Only handle toolResult messages with errors
+    if (msg.role !== "toolResult") return;
+    if (!(msg as any).isError) return;
 
-      const toolResultMsg = msg as ToolResultMessage;
-      const isNotFoundError = toolResultMsg.isError &&
-        toolResultMsg.content.some(
-          (c: any) => c.type === "text" && c.text.toLowerCase().includes("not found")
-        );
+    const toolResultMsg = msg as ToolResultMessage;
+    const combinedText = toolResultMsg.content
+      .filter((c: any) => c.type === "text")
+      .map((c: any) => c.text)
+      .join("\n");
+
+    // Check if it's a "not found" error
+    if (!isToolNotFoundError(combinedText)) return;
+
+    const toolName = toolResultMsg.toolName;
+
+    // Case 1: It's a skill name - replace with skill documentation
+    if (skillPaths.has(toolName)) {
+      const skillFilePath = skillPaths.get(toolName)!;
       
-      if (!isNotFoundError) continue;
-
-      // Check if it's a skill
-      if (skillPaths.has(toolResultMsg.toolName)) {
-        const skillName = toolResultMsg.toolName;
-        const skillFilePath = skillPaths.get(skillName)!;
+      try {
+        // Read or retrieve cached content
+        let skillContent = fileContentCache.get(skillFilePath);
+        if (!skillContent) {
+          skillContent = await fs.readFile(skillFilePath, "utf-8");
+          fileContentCache.set(skillFilePath, skillContent);
+        }
         
-        try {
-          // Read or retrieve cached content
-          let skillContent = fileContentCache.get(skillFilePath);
-          if (!skillContent) {
-            skillContent = await fs.readFile(skillFilePath, "utf-8");
-            fileContentCache.set(skillFilePath, skillContent);
-          }
-          
-          // Create a successful tool result matching what read tool would return
-          const fixedToolResult: ToolResultMessage = {
-            role: "toolResult",
-            toolCallId: toolResultMsg.toolCallId,
-            toolName: skillName,
+        ctx.ui.notify(
+          `Skill guard: Loaded skill "${toolName}" documentation`,
+          "info",
+        );
+
+        // Return replacement message
+        return {
+          message: {
+            ...toolResultMsg,
             content: [
               {
-                type: "text",
-                text: skillContent, // Raw SKILL.md content, no wrapping
+                type: "text" as const,
+                text: skillContent,
               },
             ],
-            details: {
-              path: skillFilePath,
-              sizeBytes: skillContent.length,
-              source: "skill_guard_intercept",
-            },
             isError: false,
-            timestamp: Date.now(),
-          };
-          
-          // Replace the error message with our fixed one
-          messages[i] = fixedToolResult as any;
-          modified = true;
-          ctx.ui.notify(
-            `Skill guard: Fixed "${skillName}" error → loaded documentation`,
-            "info",
-          );
-        } catch (err) {
-          // Quietly fail
-        }
-      } else {
-        // Check if this tool call had a "command" argument
-        const toolCall = findToolCall(messages, toolResultMsg.toolCallId);
-        if (toolCall && toolCall.arguments && typeof toolCall.arguments.command === "string") {
-          const { command, timeout } = toolCall.arguments;
-          let timeoutNum: number | undefined;
-          if (typeof timeout === "number") {
-            timeoutNum = timeout;
-          } else if (typeof timeout === "string") {
-            const parsed = parseFloat(timeout);
-            if (!isNaN(parsed)) timeoutNum = parsed;
-          }
-
-          try {
-            const result = await executeBashCommand(ctx.cwd, command, timeoutNum, ctx.signal);
-            const fixedToolResult: ToolResultMessage = {
-              role: "toolResult",
-              toolCallId: toolResultMsg.toolCallId,
-              toolName: "bash",
-              content: result.content,
-              isError: result.isError,
-              timestamp: Date.now(),
-            };
-            messages[i] = fixedToolResult as any;
-            modified = true;
-            ctx.ui.notify(
-              `Skill guard: Fixed "${toolResultMsg.toolName}" error → executed bash command`,
-              "info",
-            );
-          } catch (err) {
-            // Quietly fail
-          }
-        }
+          },
+        };
+      } catch {
+        // Quietly fail - let original error through
       }
     }
-    
-    return modified ? { messages: messages as any } : undefined;
+
+    // Case 2: Unknown tool with command argument - execute via bash
+    // We need to get the tool call arguments from the assistant message
+    // Since we don't have direct access here, we scan recent messages for the toolCall
+    const toolCall = findMatchingToolCall(ctx.sessionManager, toolResultMsg.toolCallId);
+    if (toolCall && toolCall.arguments?.command && typeof toolCall.arguments.command === "string") {
+      const { command, timeout } = toolCall.arguments;
+      let timeoutNum: number | undefined;
+      if (typeof timeout === "number") {
+        timeoutNum = timeout;
+      } else if (typeof timeout === "string") {
+        const parsed = parseFloat(timeout);
+        if (!isNaN(parsed)) timeoutNum = parsed;
+      }
+
+      try {
+        const result = await executeBashCommand(
+          ctx.cwd,
+          command,
+          timeoutNum,
+          ctx.signal,
+        );
+        
+        ctx.ui.notify(
+          `Skill guard: Executed bash command from "${toolName}" call`,
+          "info",
+        );
+
+        // Return replacement message
+        return {
+          message: {
+            ...toolResultMsg,
+            toolName: "bash",
+            content: result.content,
+            isError: result.isError,
+          },
+        };
+      } catch {
+        // Quietly fail - let original error through
+      }
+    }
   });
 }
