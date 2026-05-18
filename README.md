@@ -1,6 +1,6 @@
 # pi-skill-guard
 
-A pi extension for protecting against incorrect skill-in-tool-call behavior.
+A pi extension that guards against common model mistakes: wrong tool names, missing skills, broken argument schemas, and field name mismatches.
 
 ## Install
 
@@ -12,80 +12,43 @@ pi install npm:pi-skill-guard
 
 ## What it does
 
-This extension protects against incorrect skill invocation patterns. When an LLM tries to call a tool name that matches an available skill (e.g., calling `brave-search` as a tool instead of using `/skill:brave-search` or loading the skill manually), this extension **intercepts the error** and replaces it with the skill's documentation.
+The extension intercepts tool errors via the `message_end` event and silently fixes them before the LLM sees a failure. Three guard cases:
 
-### How it works
+### 1. Skill documentation injection
 
-**Key insight**: The extension uses the `context` event to intercept and fix "tool not found" errors right before they're sent to the LLM.
+When the model calls a tool name that matches an available skill (e.g. `brave-search`), the extension replaces the "not found" error with the skill's `SKILL.md` content.
 
-1. **Session start**: Load all available skills and cache their file paths
-2. **LLM calls wrong tool**: Agent creates a "Tool X not found" error message
-3. **Before next turn**: Extension's `context` handler intercepts the message flow
-4. **Detect & fix**: Replaces error with actual skill documentation from SKILL.md file
-5. **LLM sees success**: Instead of an error, the LLM receives the skill content and can learn from it
+**Before:** `Tool brave-search not found` (error)
+**After:** Full SKILL.md content injected as a successful tool result
 
-### Architecture note
+### 2. Bash command execution
 
-The `context` event fires in `transformContext()` before each LLM call, allowing us to:
-- Modify messages non-destructively (returns new array)
-- Replace tool result errors with successful results
-- Add educational notes suggesting proper `/skill:name` usage
+When the model calls an unknown tool that has a `command` argument, the extension executes it via pi's built-in bash tool. Supports optional `timeout` (number or string).
 
-This is **more efficient than pre-registering skills as tools** because:
-- ✅ No token overhead from adding extra tool schemas to every request
-- ✅ No cluttering the available tools list
-- ✅ Simpler code without TypeBox schemas
-- ✅ Better UX: actually loads skill documentation instead of just warning
+**Before:** `Tool my-script not found` (error)
+**After:** Actual bash execution result with proper truncation and temp file management
 
-### Example
+### 3. Field alias normalization (`edit` / `write` / `read`)
 
-If the model incorrectly calls:
-```json
-{ toolName: "brave-search", input: { ... } }
-```
+When a tool call fails validation due to wrong field names, the extension scans the original arguments, renames common aliases, and re-executes correctly.
 
-**Without skill-guard:**
-```json
-// The agent creates this error message
-{
-  role: "toolResult",
-  toolCallId: "call_abc123",
-  toolName: "brave-search",
-  content: [{ text: "Tool brave-search not found" }],
-  isError: true
-}
-```
-
-**With skill-guard:**
-```json
-// Extension intercepts via context event and replaces with raw SKILL.md content:
-{
-  role: "toolResult",
-  toolCallId: "call_abc123",
-  toolName: "brave-search",
-  content: [{ 
-    text: `# brave-search
-\nA pi extension for searching...
-
-## Install
-...
-` // ← Actual file content, no wrapping!
-  }],
-  details: {
-    path: "~/.pi/agent/skills/brave-search/SKILL.md",
-    sizeBytes: 1428,
-    source: "skill_guard_intercept"
-  },
-  isError: false  // ← Fixed!
-}
-```
-
-The LLM receives exactly the same content as if it had used the `read` tool on the SKILL.md file.
+| Tool | Canonical | Accepted aliases |
+|---|---|---|
+| edit | `path` | `file`, `filePath`, `file_path`, `target`, `filename`, `file_name` |
+| edit | `edits[].oldText` | `old_str`, `old_string`, `oldContent`, `old`, `original`, `search` |
+| edit | `edits[].newText` | `new_str`, `new_string`, `newContent`, `new`, `replacement`, `replace` |
+| write | `path` | `file`, `filePath`, `file_path`, `target`, `filename`, `file_name` |
+| write | `content` | `text`, `body`, `code`, `data`, `fileContent`, `contents` |
+| read | `path` | `file`, `filePath`, `file_path`, `target`, `filename`, `file_name` |
+| read | `offset` | `start`, `startLine`, `start_line`, `from`, `line` |
+| read | `limit` | `lines`, `maxLines`, `max_lines`, `count`, `numLines`, `num_lines` |
 
 ---
 
-## Use cases
+## Architecture
 
-- Prevents model from failing when it misunderstands skill invocation
-- Ensures skill content is always accessible regardless of how the model tries to use it
-- Works transparently without requiring explicit `/skill:name` commands
+All interception happens in the `message_end` event, which fires after each message is finalized and allows replacing the message in place. Each tool call is tracked by ID to prevent double-handling across the replacement chain.
+
+- `session_start`: loads skills, caches file paths
+- `turn_end`: clears handled-tool-call tracking
+- `message_end`: inspects error results, applies guards

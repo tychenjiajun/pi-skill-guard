@@ -1,6 +1,6 @@
 # pi-skill-guard
 
-一个用于防止错误的 skill-in-tool-call 行为的 pi 扩展。
+一个 pi 扩展，用于防止常见的模型错误：错误的工具名称、缺失的 skill、损坏的参数模式以及字段名不匹配。
 
 ## 安装
 
@@ -12,80 +12,43 @@ pi install npm:pi-skill-guard
 
 ## 功能说明
 
-此扩展用于防止错误的 skill 调用模式。当 LLM 尝试调用一个与可用 skill 同名的工具时（例如，将 `brave-search` 作为工具调用，而不是使用 `/skill:brave-search` 或手动加载 skill），该扩展会**拦截错误信息并将其替换为 skill 的文档内容**。
+该扩展通过 `message_end` 事件拦截工具错误，并在 LLM 看到失败之前静默修复。包含三种保护：
 
-### 工作原理
+### 1. Skill 文档注入
 
-**关键机制**：扩展使用 `context` 事件在消息发送给 LLM 之前拦截并修复 "工具未找到" 错误。
+当模型调用与可用 skill 同名的工具时（例如 `brave-search`），扩展将"未找到"错误替换为 skill 的 `SKILL.md` 内容。
 
-1. **会话开始时**：加载所有可用的 skills 并缓存它们的路径
-2. **LLM 调用错误的工具**：Agent 创建一个 "Tool X not found" 错误消息
-3. **下一个 turn 之前**：扩展的 `context` 处理器拦截消息流
-4. **检测并修复**：从 SKILL.md 文件读取实际的 skill 文档来替换错误
-5. **LLM 看到成功**：LLM 接收的是 skill 内容而不是错误，从而可以从中学习
+**修复前：** `Tool brave-search not found`（错误）
+**修复后：** 完整的 SKILL.md 内容作为成功的工具结果注入
 
-### 架构说明
+### 2. Bash 命令执行
 
-`context` 事件在每次 LLM 调用之前的 `transformContext()` 中触发，允许我们：
-- 非破坏性地修改消息（返回新数组）
-- 用成功的结果替换工具结果错误
-- 添加教育性提示，建议正确使用 `/skill:name` 命令
+当模型调用包含 `command` 参数的未知工具时，扩展通过 pi 内置的 bash 工具执行。支持可选的 `timeout`（数字或字符串）。
 
-这种方法**比预先注册 skills 为工具更高效**，因为：
-- ✅ 不会在每个请求中添加额外的工具模式而产生 token 开销
-- ✅ 不会 clutter 可用工具列表
-- ✅ 无需 TypeBox schema，代码更简单
-- ✅ 更好的用户体验：实际加载 skill 文档而不只是警告
+**修复前：** `Tool my-script not found`（错误）
+**修复后：** 实际的 bash 执行结果（含截断和临时文件管理）
 
-### 示例
+### 3. 字段别名规范化（`edit` / `write` / `read`）
 
-如果模型错误地调用：
-```json
-{ toolName: "brave-search", input: { ... } }
-```
+当工具调用因字段名错误而验证失败时，扩展扫描原始参数、重命名常见别名并重新执行。
 
-**使用 skill-guard 之前：**
-```json
-// Agent 创建此错误消息
-{
-  role: "toolResult",
-  toolCallId: "call_abc123",
-  toolName: "brave-search",
-  content: [{ text: "Tool brave-search not found" }],
-  isError: true
-}
-```
-
-**使用 skill-guard 之后：**
-```json
-// 扩展通过 context 事件拦截并替换为原始的 SKILL.md 内容：
-{
-  role: "toolResult",
-  toolCallId: "call_abc123",
-  toolName: "brave-search",
-  content: [{ 
-    text: `# brave-search
-\nA pi extension for searching...
-
-## Install
-...
-` // ← 实际的文件内容，无包装！
-  }],
-  details: {
-    path: "~/.pi/agent/skills/brave-search/SKILL.md",
-    sizeBytes: 1428,
-    source: "skill_guard_intercept"
-  },
-  isError: false  // ← 已修复！
-}
-```
-
-LLM 接收到与使用 `read` 工具读取 SKILL.md 文件完全相同的内容。
+| 工具 | 标准字段 | 接受的别名 |
+|---|---|---|
+| edit | `path` | `file`、`filePath`、`file_path`、`target`、`filename`、`file_name` |
+| edit | `edits[].oldText` | `old_str`、`old_string`、`oldContent`、`old`、`original`、`search` |
+| edit | `edits[].newText` | `new_str`、`new_string`、`newContent`、`new`、`replacement`、`replace` |
+| write | `path` | `file`、`filePath`、`file_path`、`target`、`filename`、`file_name` |
+| write | `content` | `text`、`body`、`code`、`data`、`fileContent`、`contents` |
+| read | `path` | `file`、`filePath`、`file_path`、`target`、`filename`、`file_name` |
+| read | `offset` | `start`、`startLine`、`start_line`、`from`、`line` |
+| read | `limit` | `lines`、`maxLines`、`max_lines`、`count`、`numLines`、`num_lines` |
 
 ---
 
-## 使用场景
+## 架构
 
-- 防止模型在误解 skill 调用方式时失败
-- 确保无论模型如何尝试使用 skill，都可以访问 skill 内容
-- 透明工作，无需显式使用 `/skill:name` 命令
+所有拦截均在 `message_end` 事件中处理，该事件在每条消息完成后触发，并支持原地替换消息。每个工具调用通过 ID 跟踪，防止在替换链中重复处理。
+
+- `session_start`：加载 skills，缓存文件路径
+- `turn_end`：清除已处理的工具调用跟踪
+- `message_end`：检查错误结果，应用保护机制
