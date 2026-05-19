@@ -1,6 +1,6 @@
 {
   "name": "pi-skill-guard",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "type": "module",
   "description": "Pi extension for protecting against incorrect skill-in-tool-call behavior",
   "main": "index.ts",
