@@ -43,6 +43,10 @@ pi install npm:pi-skill-guard
 | read | `offset` | `start`、`startLine`、`start_line`、`from`、`line` |
 | read | `limit` | `lines`、`maxLines`、`max_lines`、`count`、`numLines`、`num_lines` |
 
+> **Edit 工具简写支持**: 如果未提供 `edits` 数组，顶层的 `oldText`/`newText`（或它们的别名）会被自动包装为单元素 edits 数组。
+>
+> **Read 工具类型转换**: `offset` 和 `limit` 的字符串值（例如 `"10"` 而不是 `10`）会在有效时自动转换为数字。
+
 ---
 
 ## 架构

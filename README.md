@@ -43,6 +43,10 @@ When a tool call fails validation due to wrong field names, the extension scans 
 | read | `offset` | `start`, `startLine`, `start_line`, `from`, `line` |
 | read | `limit` | `lines`, `maxLines`, `max_lines`, `count`, `numLines`, `num_lines` |
 
+> **Edit tool shorthand**: If no `edits` array is provided, top-level `oldText`/`newText` (or their aliases) are automatically wrapped into a single-edit array.
+>
+> **Read tool type coercion**: String values for `offset` and `limit` (e.g. `"10"` instead of `10`) are automatically coerced to numbers when valid.
+
 ---
 
 ## Architecture
