@@ -15,12 +15,18 @@
     "bash-fallback",
     "argument-normalization"
   ],
-  "author": "",
-  "license": "ISC",
+  "author": "Jiajun Chen <tychenjiajun@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tychenjiajun/pi-skill-guard.git"
+  },
+  "homepage": "https://github.com/tychenjiajun/pi-skill-guard#readme",
   "files": [
     "*.ts",
     "README.md",
-    "README.zh-CN.md"
+    "README.zh-CN.md",
+    "LICENSE"
   ],
   "pi": {
     "extensions": [
