@@ -198,6 +198,18 @@ const normalizeEditArgs = (
     }
   }
 
+  // Pattern C: edits is a JSON string → parse it
+  if (!Array.isArray(normalized.edits) && typeof normalized.edits === "string") {
+    try {
+      const parsed = JSON.parse(normalized.edits);
+      if (Array.isArray(parsed)) {
+        normalized.edits = parsed;
+      }
+    } catch {
+      // Ignore parse errors; let validation handle it
+    }
+  }
+
   // Normalize keys inside each edit object
   if (Array.isArray(normalized.edits)) {
     for (const edit of normalized.edits) {

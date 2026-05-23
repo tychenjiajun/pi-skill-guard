@@ -1,6 +1,6 @@
 {
   "name": "pi-skill-guard",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "type": "module",
   "description": "Pi extension that guards against common LLM tool call mistakes: missing skill documentation injection, unknown tool bash fallback, and edit/write/read field name normalization",
   "main": "index.ts",
