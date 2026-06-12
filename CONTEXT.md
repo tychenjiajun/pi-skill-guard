@@ -1,6 +1,20 @@
 # CONTEXT.md
 
-Domain knowledge for understanding pi-skill-guard.
+Domain knowledge for understanding pi-skill-guard and pi-arg-corrector.
+
+## Extensions
+
+### pi-skill-guard
+Intercepts "tool not found" errors. Two cases:
+1. **Skill matching** — if the tool name matches a known skill, inject the SKILL.md content
+2. **Bash fallback** — if the unknown tool has a `command` argument, execute it via bash
+
+Uses `message_end` event (the only hook that fires for missing tools).
+
+### pi-arg-corrector
+Normalizes LLM tool call argument aliases for built-in `edit`, `write`, `read` tools. Fixes wrong field names (e.g., `file` → `path`, `old_str` → `oldText`) before schema validation.
+
+Uses `prepareArguments` on overridden built-in tools via `createXxxToolDefinition`.
 
 ## Terminology
 
@@ -11,18 +25,7 @@ A pi extension that provides knowledge/instructions to the LLM, loaded from SKIL
 An executable function the LLM can call (e.g., `bash`, `read`, `edit`). Skills are NOT tools.
 
 ### Extension
-A pi plugin that can register tools, listen to events, and modify behavior. Both skills and pi-skill-guard are extensions.
+A pi plugin that can register tools, listen to events, and modify behavior.
 
-### context event
-A pi extension hook that fires before each LLM call, allowing message modification. This is the only hook that:
-- Fires regardless of whether tools succeeded or failed
-- Allows modifying the message history
-- Returns values that actually affect what the LLM sees
-
-## Key Insight
-
-The extension uses the `context` event because it's the **only** pi extension hook that:
-1. Fires for missing tools (unlike `tool_call` and `tool_result` which are never reached)
-2. Allows modification (unlike `tool_execution_start` which is notification-only)
-
-See ARCHITECTURE.md for detailed comparison of all approaches investigated.
+### prepareArguments
+A hook on `ToolDefinition` that runs before schema validation. Used by pi-arg-corrector to normalize alias field names before the built-in tool validates them.

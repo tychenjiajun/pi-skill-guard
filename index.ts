@@ -1,25 +1,20 @@
 import { promises as fs } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import type {
-  EditToolInput,
   ExtensionAPI,
-  ReadToolInput,
   SessionEntry,
-  WriteToolInput,
 } from "@earendil-works/pi-coding-agent";
 import {
   getAgentDir,
   loadSkills,
   type Skill,
   createBashTool,
-  createEditTool,
-  createReadTool,
-  createWriteTool,
 } from "@earendil-works/pi-coding-agent";
 import type { TextContent } from "@earendil-works/pi-ai";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+// ---------------------------------------------------------------------------
+// skill loading with TTL cache
+// ---------------------------------------------------------------------------
 
 interface SkillCache {
   skills: Map<string, Skill>;
@@ -63,6 +58,10 @@ const findSkillFilePath = async (skill: Skill): Promise<string> => {
   }
 };
 
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
 function isToolNotFoundError(text: string): boolean {
   const lower = text.toLowerCase().trim();
   if (lower === "not found") return true;
@@ -70,188 +69,6 @@ function isToolNotFoundError(text: string): boolean {
     return true;
   return false;
 }
-
-// ---------------------------------------------------------------------------
-// alias normalization for edit / write / read argument fields
-// ---------------------------------------------------------------------------
-
-const PATH_FIELD_ALIASES = {
-  path: ["file", "filePath", "file_path", "target", "filename", "file_name"],
-} as const;
-
-const EDIT_FIELD_ALIASES: Record<string, readonly string[]> = {
-  ...PATH_FIELD_ALIASES,
-  oldText: [
-    "old_str",
-    "old_string",
-    "old_text",
-    "oldStr",
-    "oldString",
-    "oldContent",
-    "old_content",
-    "old",
-    "original",
-    "search",
-  ],
-  newText: [
-    "new_str",
-    "new_string",
-    "new_text",
-    "newStr",
-    "newString",
-    "newContent",
-    "new_content",
-    "new",
-    "replacement",
-    "replace",
-  ],
-};
-
-const WRITE_FIELD_ALIASES: Record<string, readonly string[]> = {
-  ...PATH_FIELD_ALIASES,
-  content: [
-    "text",
-    "body",
-    "code",
-    "data",
-    "fileContent",
-    "file_content",
-    "contents",
-  ],
-};
-
-const READ_FIELD_ALIASES: Record<string, readonly string[]> = {
-  ...PATH_FIELD_ALIASES,
-  offset: ["start", "startLine", "start_line", "from", "line"],
-  limit: ["lines", "maxLines", "max_lines", "count", "numLines", "num_lines"],
-};
-
-const buildAliasMap = (aliases: Record<string, readonly string[]>) => {
-  const map = new Map<string, string>();
-  for (const [canonical, alts] of Object.entries(aliases)) {
-    for (const alt of alts) {
-      if (!map.has(alt)) map.set(alt, canonical);
-    }
-  }
-  return map;
-};
-
-const editAliasMap = buildAliasMap(EDIT_FIELD_ALIASES);
-const writeAliasMap = buildAliasMap(WRITE_FIELD_ALIASES);
-const readAliasMap = buildAliasMap(READ_FIELD_ALIASES);
-
-const renameAliasKeys = (
-  obj: Record<string, unknown>,
-  canonicalKeys: Record<string, readonly string[]>,
-  aliasMap: Map<string, string>,
-) => {
-  for (const [key, value] of Object.entries(obj)) {
-    const canonical = key in canonicalKeys ? key : aliasMap.get(key);
-    if (canonical && canonical !== key) {
-      obj[canonical] = value;
-      delete obj[key];
-    }
-  }
-};
-
-/** Returns a deep clone with alias keys renamed. Does NOT mutate the original. */
-const normalizeEditArgs = (
-  args: Record<string, unknown>,
-): Record<string, unknown> => {
-  const normalized = structuredClone(args);
-
-  // Normalize top-level keys (path aliases like "file" → "path")
-  renameAliasKeys(normalized, EDIT_FIELD_ALIASES, editAliasMap);
-
-  // Pattern A: oldText/newText at top level (no edits array) → wrap
-  if (
-    !Array.isArray(normalized.edits) &&
-    typeof normalized.oldText === "string" &&
-    typeof normalized.newText === "string"
-  ) {
-    normalized.edits = [
-      { oldText: normalized.oldText, newText: normalized.newText },
-    ];
-    delete normalized.oldText;
-    delete normalized.newText;
-  }
-
-  // Pattern B: alias keys at top level → wrap into edits
-  if (!Array.isArray(normalized.edits)) {
-    const topOld = Object.keys(normalized).find(
-      (k) => editAliasMap.get(k) === "oldText",
-    );
-    const topNew = Object.keys(normalized).find(
-      (k) => editAliasMap.get(k) === "newText",
-    );
-    if (
-      topOld &&
-      topNew &&
-      typeof normalized[topOld] === "string" &&
-      typeof normalized[topNew] === "string"
-    ) {
-      normalized.edits = [
-        { oldText: normalized[topOld], newText: normalized[topNew] },
-      ];
-      delete normalized[topOld];
-      delete normalized[topNew];
-    }
-  }
-
-  // Pattern C: edits is a JSON string → parse it
-  if (!Array.isArray(normalized.edits) && typeof normalized.edits === "string") {
-    try {
-      const parsed = JSON.parse(normalized.edits);
-      if (Array.isArray(parsed)) {
-        normalized.edits = parsed;
-      }
-    } catch {
-      // Ignore parse errors; let validation handle it
-    }
-  }
-
-  // Normalize keys inside each edit object
-  if (Array.isArray(normalized.edits)) {
-    for (const edit of normalized.edits) {
-      if (edit && typeof edit === "object") {
-        renameAliasKeys(edit, EDIT_FIELD_ALIASES, editAliasMap);
-      }
-    }
-  }
-
-  return normalized;
-};
-
-const normalizeWriteArgs = (
-  args: Record<string, unknown>,
-): Record<string, unknown> => {
-  const normalized = structuredClone(args);
-  renameAliasKeys(normalized, WRITE_FIELD_ALIASES, writeAliasMap);
-  return normalized;
-};
-
-const normalizeReadArgs = (
-  args: Record<string, unknown>,
-): Record<string, unknown> => {
-  const normalized = structuredClone(args);
-  renameAliasKeys(normalized, READ_FIELD_ALIASES, readAliasMap);
-  // Coerce string offset/limit values to numbers when possible
-  if (typeof normalized.offset === "string") {
-    const n = parseFloat(normalized.offset);
-    if (!isNaN(n)) normalized.offset = n;
-  }
-  if (typeof normalized.limit === "string") {
-    const n = parseFloat(normalized.limit);
-    if (!isNaN(n)) normalized.limit = n;
-  }
-  return normalized;
-};
-
-// ---------------------------------------------------------------------------
-// session-entry scanner (message_end only sees one message at a time)
-// ---------------------------------------------------------------------------
-
-type Entryish = { type: string; message?: { role: string; content: unknown } };
 
 const findToolCallArgs = (
   entries: readonly SessionEntry[],
@@ -281,7 +98,7 @@ const findToolCallArgs = (
 };
 
 // ---------------------------------------------------------------------------
-// extension
+// extension — handles "tool not found" errors only
 // ---------------------------------------------------------------------------
 
 export default function skillGuardExtension(pi: ExtensionAPI) {
@@ -321,11 +138,13 @@ export default function skillGuardExtension(pi: ExtensionAPI) {
       .map((c) => c.text)
       .join("\n");
 
+    if (!isToolNotFoundError(combinedText)) return;
+
     const toolName = msg.toolName;
     const toolCallId = msg.toolCallId;
 
     // ── Case 1: skill name (tool not found) ───────────────────────────
-    if (isToolNotFoundError(combinedText) && skillPaths.has(toolName)) {
+    if (skillPaths.has(toolName)) {
       const skillFilePath = skillPaths.get(toolName)!;
       try {
         let skillContent = fileContentCache.get(skillFilePath);
@@ -354,226 +173,55 @@ export default function skillGuardExtension(pi: ExtensionAPI) {
     }
 
     // ── Case 2: unknown tool with command arg (tool not found) ────────
-    if (isToolNotFoundError(combinedText)) {
-      const entries = ctx.sessionManager.getEntries();
-      const args = findToolCallArgs(entries, toolCallId);
-      const command = args?.command;
-      if (typeof command !== "string") return;
-
-      let timeoutNum: number | undefined;
-      const rawTimeout = args!.timeout;
-      if (typeof rawTimeout === "number") {
-        timeoutNum = rawTimeout;
-      } else if (typeof rawTimeout === "string") {
-        const parsed = parseFloat(rawTimeout);
-        if (!isNaN(parsed)) timeoutNum = parsed;
-      }
-
-      try {
-        const execResult = await createBashTool(ctx.cwd).execute(
-          toolCallId,
-          timeoutNum !== undefined
-            ? { command, timeout: timeoutNum }
-            : { command },
-          ctx.signal,
-          undefined,
-        );
-
-        handledToolCallIds.add(toolCallId);
-        ctx.ui.notify(
-          `Skill guard: Executed bash command from "${toolName}" call`,
-          "info",
-        );
-
-        return {
-          message: { ...msg, content: execResult.content, isError: false },
-        };
-      } catch (err) {
-        const errorText = err instanceof Error ? err.message : String(err);
-
-        handledToolCallIds.add(toolCallId);
-        ctx.ui.notify(
-          `Skill guard: Bash command from "${toolName}" failed: ${errorText.slice(0, 80)}`,
-          "warning",
-        );
-
-        return {
-          message: {
-            ...msg,
-            content: [{ type: "text" as const, text: errorText }],
-            isError: true,
-          },
-        };
-      }
-    }
-
-    // ── Case 3: edit/write/read validation error (wrong field names) ─
-    if (!combinedText.startsWith("Validation failed")) {
-      return;
-    }
-
     const entries = ctx.sessionManager.getEntries();
     const args = findToolCallArgs(entries, toolCallId);
-    if (!args) return;
+    const command = args?.command;
+    if (typeof command !== "string") return;
 
-    // ── read ─────────────────────────────────────────────────────────
-    if (toolName === "read") {
-      const raw = normalizeReadArgs(args);
-      const normalized: ReadToolInput = (() => {
-        const base = { path: String(raw.path ?? "") };
-        const offset = typeof raw.offset === "number" ? raw.offset : NaN;
-        const limit = typeof raw.limit === "number" ? raw.limit : NaN;
-        return {
-          ...base,
-          ...(isFinite(offset) ? { offset } : {}),
-          ...(isFinite(limit) ? { limit } : {}),
-        };
-      })();
-
-      try {
-        const execResult = await createReadTool(ctx.cwd).execute(
-          toolCallId,
-          normalized,
-          ctx.signal,
-          undefined,
-        );
-
-        handledToolCallIds.add(toolCallId);
-        ctx.ui.notify(
-          `Skill guard: Fixed "read" field names and re-executed`,
-          "info",
-        );
-
-        return {
-          message: {
-            ...msg,
-            content: execResult.content,
-            details: execResult.details,
-            isError: false,
-          },
-        };
-      } catch (err) {
-        const errorText = err instanceof Error ? err.message : String(err);
-        handledToolCallIds.add(toolCallId);
-        ctx.ui.notify(
-          `Skill guard: "read" re-execution failed: ${errorText.slice(0, 80)}`,
-          "warning",
-        );
-        return {
-          message: {
-            ...msg,
-            content: [{ type: "text" as const, text: errorText }],
-            isError: true,
-          },
-        };
-      }
+    let timeoutNum: number | undefined;
+    const rawTimeout = args!.timeout;
+    if (typeof rawTimeout === "number") {
+      timeoutNum = rawTimeout;
+    } else if (typeof rawTimeout === "string") {
+      const parsed = parseFloat(rawTimeout);
+      if (!isNaN(parsed)) timeoutNum = parsed;
     }
 
-    // ── write ────────────────────────────────────────────────────────
-    if (toolName === "write") {
-      const raw = normalizeWriteArgs(args);
-      const normalized: WriteToolInput = {
-        path: String(raw.path ?? ""),
-        content: String(raw.content ?? ""),
+    try {
+      const execResult = await createBashTool(ctx.cwd).execute(
+        toolCallId,
+        timeoutNum !== undefined
+          ? { command, timeout: timeoutNum }
+          : { command },
+        ctx.signal,
+        undefined,
+      );
+
+      handledToolCallIds.add(toolCallId);
+      ctx.ui.notify(
+        `Skill guard: Executed bash command from "${toolName}" call`,
+        "info",
+      );
+
+      return {
+        message: { ...msg, content: execResult.content, isError: false },
       };
+    } catch (err) {
+      const errorText = err instanceof Error ? err.message : String(err);
 
-      try {
-        const execResult = await createWriteTool(ctx.cwd).execute(
-          toolCallId,
-          normalized,
-          ctx.signal,
-          undefined,
-        );
+      handledToolCallIds.add(toolCallId);
+      ctx.ui.notify(
+        `Skill guard: Bash command from "${toolName}" failed: ${errorText.slice(0, 80)}`,
+        "warning",
+      );
 
-        handledToolCallIds.add(toolCallId);
-        ctx.ui.notify(
-          `Skill guard: Fixed "write" field names and re-executed`,
-          "info",
-        );
-
-        return {
-          message: {
-            ...msg,
-            content: execResult.content,
-            details: execResult.details,
-            isError: false,
-          },
-        };
-      } catch (err) {
-        const errorText = err instanceof Error ? err.message : String(err);
-        handledToolCallIds.add(toolCallId);
-        ctx.ui.notify(
-          `Skill guard: "write" re-execution failed: ${errorText.slice(0, 80)}`,
-          "warning",
-        );
-        return {
-          message: {
-            ...msg,
-            content: [{ type: "text" as const, text: errorText }],
-            isError: true,
-          },
-        };
-      }
-    }
-
-    // ── edit ─────────────────────────────────────────────────────────
-    if (toolName === "edit") {
-      const raw = normalizeEditArgs(args);
-      const edits: { oldText: string; newText: string }[] = Array.isArray(
-        raw.edits,
-      )
-        ? raw.edits
-            .filter(
-              (e): e is Record<string, unknown> =>
-                e !== null && typeof e === "object",
-            )
-            .map((e) => ({
-              oldText: String(e.oldText ?? ""),
-              newText: String(e.newText ?? ""),
-            }))
-        : [];
-      const normalized: EditToolInput = {
-        path: String(raw.path ?? ""),
-        edits,
+      return {
+        message: {
+          ...msg,
+          content: [{ type: "text" as const, text: errorText }],
+          isError: true,
+        },
       };
-
-      try {
-        const execResult = await createEditTool(ctx.cwd).execute(
-          toolCallId,
-          normalized,
-          ctx.signal,
-          undefined,
-        );
-
-        handledToolCallIds.add(toolCallId);
-        ctx.ui.notify(
-          `Skill guard: Fixed "edit" field names and re-executed`,
-          "info",
-        );
-
-        return {
-          message: {
-            ...msg,
-            content: execResult.content,
-            details: execResult.details,
-            isError: false,
-          },
-        };
-      } catch (err) {
-        const errorText = err instanceof Error ? err.message : String(err);
-        handledToolCallIds.add(toolCallId);
-        ctx.ui.notify(
-          `Skill guard: "edit" re-execution failed: ${errorText.slice(0, 80)}`,
-          "warning",
-        );
-        return {
-          message: {
-            ...msg,
-            content: [{ type: "text" as const, text: errorText }],
-            isError: true,
-          },
-        };
-      }
     }
   });
 }

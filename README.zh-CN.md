@@ -1,6 +1,6 @@
 # pi-skill-guard
 
-一个 pi 扩展，用于防止常见的模型错误：错误的工具名称、缺失的 skill、损坏的参数模式以及字段名不匹配。
+一个 pi 扩展，用于拦截"工具未找到"错误：为匹配的 skill 名称注入文档，并对包含 `command` 参数的未知工具回退到 bash 执行。
 
 ## 安装
 
@@ -12,7 +12,7 @@ pi install npm:pi-skill-guard
 
 ## 功能说明
 
-该扩展通过 `message_end` 事件拦截工具错误，并在 LLM 看到失败之前静默修复。包含三种保护：
+该扩展通过 `message_end` 事件拦截工具错误，并在 LLM 看到失败之前静默修复。包含两种保护：
 
 ### 1. Skill 文档注入
 
@@ -28,24 +28,11 @@ pi install npm:pi-skill-guard
 **修复前：** `Tool my-script not found`（错误）
 **修复后：** 实际的 bash 执行结果（含截断和临时文件管理）
 
-### 3. 字段别名规范化（`edit` / `write` / `read`）
+---
 
-当工具调用因字段名错误而验证失败时，扩展扫描原始参数、重命名常见别名并重新执行。
+## 相关扩展
 
-| 工具 | 标准字段 | 接受的别名 |
-|---|---|---|
-| edit | `path` | `file`、`filePath`、`file_path`、`target`、`filename`、`file_name` |
-| edit | `edits[].oldText` | `old_str`、`old_string`、`oldContent`、`old`、`original`、`search` |
-| edit | `edits[].newText` | `new_str`、`new_string`、`newContent`、`new`、`replacement`、`replace` |
-| write | `path` | `file`、`filePath`、`file_path`、`target`、`filename`、`file_name` |
-| write | `content` | `text`、`body`、`code`、`data`、`fileContent`、`contents` |
-| read | `path` | `file`、`filePath`、`file_path`、`target`、`filename`、`file_name` |
-| read | `offset` | `start`、`startLine`、`start_line`、`from`、`line` |
-| read | `limit` | `lines`、`maxLines`、`max_lines`、`count`、`numLines`、`num_lines` |
-
-> **Edit 工具简写支持**: 如果未提供 `edits` 数组，顶层的 `oldText`/`newText`（或它们的别名）会被自动包装为单元素 edits 数组。
->
-> **Read 工具类型转换**: `offset` 和 `limit` 的字符串值（例如 `"10"` 而不是 `10`）会在有效时自动转换为数字。
+字段别名规范化（`edit` / `write` / `read` 参数修正），请参见 [pi-arg-corrector](https://github.com/tychenjiajun/pi-arg-corrector)。
 
 ---
 

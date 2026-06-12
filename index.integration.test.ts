@@ -23,7 +23,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => {
       skills: [{ name: "my-skill", filePath: "/fake/skills/my-skill/SKILL.md" }],
     })),
     createBashTool: vi.fn(() => ({
-      execute: vi.fn(async (_tcId, args) => ({
+      execute: vi.fn(async (_tcId: string, args: { command: string }) => ({
         content: [{ type: "text" as const, text: `ran: ${args.command}` }],
         isError: false,
       })),

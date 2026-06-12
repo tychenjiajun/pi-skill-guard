@@ -1,6 +1,6 @@
 # pi-skill-guard
 
-A pi extension that guards against common model mistakes: wrong tool names, missing skills, broken argument schemas, and field name mismatches.
+A pi extension that intercepts "tool not found" errors: injects skill documentation for matching skill names and falls back to bash for unknown tools with a command argument.
 
 ## Install
 
@@ -12,7 +12,7 @@ pi install npm:pi-skill-guard
 
 ## What it does
 
-The extension intercepts tool errors via the `message_end` event and silently fixes them before the LLM sees a failure. Three guard cases:
+The extension intercepts tool errors via the `message_end` event and silently fixes them before the LLM sees a failure. Two guard cases:
 
 ### 1. Skill documentation injection
 
@@ -28,24 +28,11 @@ When the model calls an unknown tool that has a `command` argument, the extensio
 **Before:** `Tool my-script not found` (error)
 **After:** Actual bash execution result with proper truncation and temp file management
 
-### 3. Field alias normalization (`edit` / `write` / `read`)
+---
 
-When a tool call fails validation due to wrong field names, the extension scans the original arguments, renames common aliases, and re-executes correctly.
+## Related
 
-| Tool | Canonical | Accepted aliases |
-|---|---|---|
-| edit | `path` | `file`, `filePath`, `file_path`, `target`, `filename`, `file_name` |
-| edit | `edits[].oldText` | `old_str`, `old_string`, `oldContent`, `old`, `original`, `search` |
-| edit | `edits[].newText` | `new_str`, `new_string`, `newContent`, `new`, `replacement`, `replace` |
-| write | `path` | `file`, `filePath`, `file_path`, `target`, `filename`, `file_name` |
-| write | `content` | `text`, `body`, `code`, `data`, `fileContent`, `contents` |
-| read | `path` | `file`, `filePath`, `file_path`, `target`, `filename`, `file_name` |
-| read | `offset` | `start`, `startLine`, `start_line`, `from`, `line` |
-| read | `limit` | `lines`, `maxLines`, `max_lines`, `count`, `numLines`, `num_lines` |
-
-> **Edit tool shorthand**: If no `edits` array is provided, top-level `oldText`/`newText` (or their aliases) are automatically wrapped into a single-edit array.
->
-> **Read tool type coercion**: String values for `offset` and `limit` (e.g. `"10"` instead of `10`) are automatically coerced to numbers when valid.
+For field alias normalization (`edit` / `write` / `read` argument correction), see [pi-arg-corrector](https://github.com/tychenjiajun/pi-arg-corrector).
 
 ---
 

@@ -1,204 +1,63 @@
 # Architecture & Design Decisions
 
-This document explains the design decisions behind pi-skill-guard and why we use the `context` event instead of other approaches.
+This document explains the design decisions behind pi-skill-guard and pi-arg-corrector.
 
 ## Problem Statement
 
-When an LLM tries to call a tool that matches a skill name (e.g., `brave-search`) instead of using the proper `/skill:name` command, pi-agent-core throws "Tool not found" because skills are not registered as tools by default.
+LLMs make two kinds of tool call mistakes:
 
-## Investigated Approaches
+1. **Tool not found** — calling a tool name that matches a skill (e.g., `brave-search`) instead of using `/skill:name`, or calling a nonexistent tool with a `command` argument
+2. **Wrong argument names** — calling `edit` with `file` instead of `path`, or `old_str` instead of `oldText`
 
-### ❌ Approach 1: Intercept at `tool_call` Event
+These are separate problems requiring separate solutions.
 
-```typescript
-pi.on("tool_call", async (event) => {
-  if (isSkillName(event.toolName)) {
-    // Too late - validation already failed!
-  }
-});
-```
+## Solution: Two Extensions
 
-**Problem**: The `tool_call` extension event fires in the `beforeToolCall` hook, which only executes **after** pi-agent-core validates that the tool exists. Missing tools never reach this hook.
+### pi-skill-guard — "tool not found" interception
 
-**Flow**:
-```
-prepareToolCall() → check if tool exists → FAIL for missing tools → return immediate error
-                                    ↓ Never reaches beforeToolCall hook
-                            Extension's tool_call handler
-```
+Uses `message_end` event to detect "tool not found" errors and:
+- **Case 1**: If tool name matches a skill → inject SKILL.md content
+- **Case 2**: If unknown tool has `command` arg → execute via bash
 
----
+**Why `message_end`?**
 
-### ❌ Approach 2: Pre-register Skills as Tools
+| Event | Fires for missing tool? | Can modify result? |
+|---|---|---|
+| `tool_call` | ❌ No | ✅ Yes |
+| `tool_result` | ❌ No | ✅ Yes |
+| `tool_execution_end` | ✅ Yes | ❌ No |
+| **`message_end`** | ✅ **Yes** | ✅ **Yes** |
 
-```typescript
-pi.on("session_start", async () => {
-  const skills = await loadSkills();
-  for (const skill of skills) {
-    pi.registerTool({
-      name: skill.name,
-      parameters: Type.Object({...}),
-      execute: ...
-    });
-  }
-});
-```
+The `tool_call` and `tool_result` events never fire for missing tools — pi-agent-core short-circuits before reaching them. `message_end` is the only hook that fires for all tool results including "not found" errors.
 
-**Pros**: Works reliably because tools exist before validation.
+### pi-arg-corrector — argument alias normalization
 
-**Cons**:
-- 📈 Token overhead (~50-100 tokens per skill per request)
-- 📋 Clutters the available tools list presented to LLM
-- 🎯 May confuse LLM about whether it should call tools vs use `/skill:name`
-- 🔧 Requires maintaining TypeBox schemas for all skills
+Uses `prepareArguments` on overridden built-in tools to fix alias field names before schema validation.
 
----
+**Why `prepareArguments` + tool override?**
 
-### ❌ Approach 3: Intercept at `tool_execution_start`
+| Approach | Pros | Cons |
+|---|---|---|
+| `message_end` + re-execute | Works | Double execution, error visible to LLM, needs session scanning |
+| `tool_call` mutation | Clean, no re-execution | Mutates in place, couples to event ordering |
+| **`prepareArguments` override** | **Cleanest — normalizes before validation, built-in execute/renderer inherited** | **Needs `cwd` at registration (from `session_start`)** |
 
-```typescript
-pi.on("tool_execution_start", async (event) => {
-  // Can see toolName but cannot modify or block
-});
-```
+The override approach uses `createEditToolDefinition(cwd)` to get the full built-in tool definition (execute, renderer, schema), then adds `prepareArguments` to normalize aliases. The LLM never sees a validation error — the normalized args pass validation on the first try.
 
-**Problem**: This event is notification-only with no return value. Cannot prevent execution or modify arguments. Handler results are discarded by the framework.
+## Investigated Approaches (Rejected)
 
----
+### ❌ `tool_call` event for "tool not found"
 
-### ❌ Approach 4: Fix at `tool_result` Event
+`tool_call` fires in `beforeToolCall` hook, which only executes **after** pi-agent-core validates that the tool exists. Missing tools never reach this hook.
 
-```typescript
-pi.on("tool_result", async (event) => {
-  // Too late - this hook never fires for missing tools!
-});
-```
+### ❌ `tool_result` event for "tool not found"
 
-**Problem**: The `tool_result` extension event fires in the `afterToolCall` hook, which only executes for successfully prepared tools. Immediate errors skip the entire finalization process.
+`tool_result` fires in `afterToolCall` hook, which only executes for successfully prepared tools. Immediate errors skip finalization entirely.
 
-**Code evidence from pi-agent-core**:
-```typescript
-if (preparation.kind === "immediate") {
-  finalized = { result: preparation.result, isError: true };
-  await emitToolExecutionEnd(finalized, emit);
-  continue; // ← Skips finalizeExecutedToolCall where afterToolCall lives!
-}
-```
+### ❌ Pre-register skills as tools
 
----
+Works but adds token overhead (~50-100 tokens per skill per request), clutters the tools list, and may confuse LLM about tool vs skill usage.
 
-### ✅ Approach 5: Intercepts at `context` Event (Chosen Solution)
+### ❌ `context` event
 
-```typescript
-pi.on("context", async (event, ctx) => {
-  const messages = [...event.messages];
-  
-  // Find "tool not found" errors for our skills
-  for (const msg of messages) {
-    if (msg.role === "toolResult" && 
-        isSkillError(msg)) {
-      
-      // Replace with actual skill content
-      const fixedMsg = {
-        ...msg,
-        content: [await readSkillDoc()],
-        isError: false
-      };
-      
-      // Fix in array
-      messages[messages.indexOf(msg)] = fixedMsg;
-    }
-  }
-  
-  return modified ? { messages } : undefined;
-});
-```
-
-**Why This Works**:
-
-1. **Timing**: Fires in `transformContext()` before each LLM call, giving us access to all accumulated messages including tool result errors
-
-2. **Modification Power**: Can return new message array to replace error messages with successful ones containing skill documentation
-
-3. **No Token Overhead**: Doesn't add extra tools to the schema sent to LLM
-
-4. **Clean UX**: LLM receives actual skill content instead of errors, can learn from it
-
-5. **Educational**: Can add notes suggesting proper `/skill:name` usage
-
-**Event Flow**:
-```
-Turn N: Assistant calls "brave-search" tool
-  ↓
-Agent creates toolResult { isError: true, text: "not found" }
-  ↓
-Add to context.messages[]
-  ↓
-Turn N+1 starts
-  ↓
-transformContext() fires
-  ├─ Extension's context handler intercepts
-  │   └─ Replaces error with skill documentation
-  ↓
-convertToLlm() converts AgentMessage[] to LLM format
-  ↓
-LLM sees successful tool result instead of error ✓
-```
-
-## Key Insights
-
-### Why `context` Event Is Special
-
-| Event | Fires For Missing Tool? | Can Modify? | Useful? |
-|-------|------------------------|-------------|---------|
-| `tool_execution_start` | ✅ Yes | ❌ No | ❌ Notification only |
-| `tool_call` | ❌ No | ✅ Yes | ❌ Never reached |
-| `tool_result` | ❌ No | ✅ Yes | ❌ Hook doesn't fire |
-| `tool_execution_end` | ✅ Yes | ❌ No | ❌ Notification only |
-| **`context`** | ✅ Yes | ✅ **Yes** | ✅ **Perfect!** |
-
-The `context` event is the **only extension hook** that:
-- Fires regardless of whether tools succeeded or failed
-- Allows modifying the message history
-- Returns values that actually affect what the LLM sees
-
-### Message Mutation Pattern
-
-```typescript
-pi.on("context", async (event, ctx) => {
-  const messages = [...event.messages]; // Deep copy is safe
-  
-  // Mutate messages
-  const idx = messages.findIndex(m => shouldFix(m));
-  if (idx !== -1) {
-    messages[idx] = fixedMessage;
-    return { messages }; // Return modified array
-  }
-  
-  return undefined; // Or don't return anything
-});
-```
-
-From types.d.ts:
-> Fired before each LLM call. Can modify messages non-destructively. See Session Format for message types.
->
-> event.messages - deep copy, safe to modify
-
-## Future Enhancements
-
-Potential improvements could include:
-
-1. **Rate limiting notifications**: Don't spam UI for repeated errors
-2. **Learning mechanism**: Track which skills get confused most often
-3. **Custom fixers**: Allow extensions to register custom handlers for specific skill names
-4. **Session stats**: Report how many errors were intercepted per session
-
-## Conclusion
-
-Using the `context` event provides the optimal balance of:
-- ✅ Reliability (works for all error cases)
-- ✅ Efficiency (no token overhead)
-- ✅ Cleanliness (doesn't clutter tool list)
-- ✅ Educational value (provides actual content to learn from)
-
-This pattern demonstrates how understanding the event architecture enables elegant solutions within framework constraints.
+Works (fires for all messages, allows modification), but `message_end` is more targeted — it fires per-message rather than requiring scanning the full message array each LLM call.
